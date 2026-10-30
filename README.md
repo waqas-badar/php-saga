@@ -403,6 +403,13 @@ composer check
 
 ---
 
+## 🤝 Credits & Acknowledgments
+
+- **Author & Maintainer**: Waqas Badar ([@waqas-badar](https://github.com/waqas-badar))
+- **Architecture & Development**: Developed in collaboration with **Antigravity** (Google DeepMind).
+
+---
+
 ## 📄 License
 
 This package is open-source software licensed under the [MIT license](LICENSE).

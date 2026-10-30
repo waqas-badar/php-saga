@@ -6,7 +6,12 @@
     "authors": [
         {
             "name": "Waqas Badar",
-            "email": "mwaqasbadar@yahoo.com"
+            "email": "mwaqasbadar@yahoo.com",
+            "role": "Lead Developer"
+        },
+        {
+            "name": "Antigravity (Google DeepMind)",
+            "role": "AI Pair Programmer"
         }
     ],
     "require": {
