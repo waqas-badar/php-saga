@@ -17,10 +17,11 @@ Handle complex, distributed, multi-step business transactions without external r
 - **Framework-Agnostic & Lightweight**: Zero runtime framework coupling. Runs in vanilla PHP, Laravel, Symfony, or background queue workers.
 - **Strictly Typed & Modern**: Built for PHP 8.2+ with backed Enums, `readonly` classes, and match expressions.
 - **Automatic LIFO Rollback**: When any step fails, previously completed steps are safely compensated in reverse order (Last-In, First-Out).
+- **Workflow Halting (Suspension)**: Intentionally halt execution (e.g. awaiting webhooks, payment approvals, or human verification) without rolling back.
+- **Crash Recovery & Resumption**: Rehydrate interrupted or suspended workflows from storage and resume from the exact pending step.
 - **Configurable Retries**: Per-step retry policies with millisecond backoff for transient network glitches.
-- **Crash Recovery & Resumption**: Rehydrate interrupted or queued workflows from storage and resume from the exact pending step.
 - **PSR-11 & PSR-14 Compliant**: On-demand dependency injection for steps (`class-string`) and native event dispatching for observability.
-- **Pluggable Persistence**: Includes `PdoSagaRepository` (SQLite, MySQL, Postgres), `FileSagaRepository` (disk-based JSON), and `InMemorySagaRepository`.
+- **Pluggable Persistence**: Includes `FileSagaRepository` (disk-based JSON), `PdoSagaRepository` (SQLite, MySQL, Postgres), and `InMemorySagaRepository`.
 
 ---
 
@@ -145,128 +146,200 @@ $result = $coordinator->run(new OrderFulfillmentSaga(), [
 
 ## 🛠️ Advanced Capabilities
 
-### 🔁 Crash Recovery & Workflow Resumption
+### ⏸️ Workflow Halting (Suspension) & Resumption
 
-In distributed architectures, background workers, or queue processing, workflows are vulnerable to external interruptions:
-- A worker process terminates or times out mid-execution.
-- A deployment or pod restart kills an active saga.
-- A database or third-party API is temporarily unreachable.
+Real-world workflows frequently need to pause and wait for external asynchronous events:
+- A customer must complete a **3D-Secure card verification** or bank redirect.
+- Waiting for a **webhook callback** from an external payment gateway.
+- Waiting for **human approval** or an **email/SMS OTP** code.
+- Handling unexpected crashes (worker reboot or deployment restart) mid-execution.
 
-Rather than re-running the entire saga from the start (which could charge a customer twice or duplicate external mutations), `php-saga` provides native **snapshot rehydration and execution resumption**.
-
-#### How Resumption Works Under the Hood
-1. **Continuous State Snapshotting**: After each successful step, `SagaCoordinator` saves the updated `SagaContext`, list of `completedSteps`, and current status to the `SagaRepositoryInterface`.
-2. **Step Skipping**: When `$coordinator->resume($sagaId, $saga)` is called, the coordinator reads the persisted record and builds a set of already completed step names. Steps present in `completedSteps` are **skipped**.
-3. **Seamless Continuation**: Execution picks up directly at the first pending step, passing the restored context.
-4. **Unified LIFO Compensation**: If a step fails *after* resumption, the coordinator triggers backward compensation across **all** completed steps (both the steps executed in the initial run and those executed during the resumed run) in strict reverse order (Last-In, First-Out).
+Rather than blocking a PHP process or restarting from scratch, `php-saga` allows steps to **halt execution safely**:
+1. Call `$context->suspend('Reason')` or throw `new SagaSuspendedException('Reason')`.
+2. The coordinator marks status as **`suspended`**, records the **`exit_reason`**, saves the current state to the repository, and stops without rolling back.
+3. Later, when the external trigger arrives, simply call `$coordinator->resume($sagaId, $saga)` (or `$coordinator->run(...)` with the same ID).
+4. Already completed steps are **skipped**, and execution smoothly resumes from the exact pending step.
 
 ---
 
-#### End-to-End Example: Crash and Resumption
+#### Complete End-to-End Example (Using File Storage)
 
-Below is a complete, runnable example demonstrating how an interrupted saga is resumed:
+This example uses **`FileSagaRepository`** to persist workflow progress directly as JSON files on disk.
 
 ```php
 use PhpSaga\Contracts\StepInterface;
 use PhpSaga\Execution\SagaBuilder;
 use PhpSaga\Execution\SagaCoordinator;
 use PhpSaga\SagaContext;
-use PhpSaga\SagaStatus;
-use PhpSaga\Storage\PdoSagaRepository;
+use PhpSaga\Storage\FileSagaRepository;
 
-// 1. Setup Database Repository
-$pdo = new PDO('sqlite::memory:');
-$repository = new PdoSagaRepository($pdo);
-$repository->createSchema();
+// 1. Setup File Storage (saves JSON files in storage/sagas/)
+$storageDir = __DIR__ . '/storage/sagas';
+$repository = new FileSagaRepository($storageDir);
 
 // 2. Define Steps
-class ReserveStockStep implements StepInterface
+class CreateOrderStep implements StepInterface
 {
-    public function getName(): string { return 'ReserveStock'; }
-    public function execute(SagaContext $c): void {
-        echo "[Run] Stock reserved for Order #" . $c->get('order_id') . PHP_EOL;
-        $c->set('stock_reserved', true);
+    public function getName(): string { return 'CreateOrder'; }
+
+    public function execute(SagaContext $c): void
+    {
+        echo "[Run] Step 1: Order #{$c->get('order_id')} created." . PHP_EOL;
+        $c->set('order_created', true);
     }
-    public function compensate(SagaContext $c): void {
-        echo "[Rollback] Stock released." . PHP_EOL;
-        $c->set('stock_reserved', false);
+
+    public function compensate(SagaContext $c): void
+    {
+        echo "[Rollback] Step 1: Order cancelled." . PHP_EOL;
     }
 }
 
-class ChargeCustomerStep implements StepInterface
+class RequestBankAuthorizationStep implements StepInterface
 {
-    public function getName(): string { return 'ChargeCustomer'; }
-    public function execute(SagaContext $c): void {
-        echo "[Run] Charged $" . $c->get('amount') . PHP_EOL;
-        $c->set('payment_id', 'PAY-987');
+    public function getName(): string { return 'RequestBankAuthorization'; }
+
+    public function execute(SagaContext $c): void
+    {
+        echo "[Run] Step 2: Payment requested ($" . $c->get('amount') . ")." . PHP_EOL;
+        $c->set('auth_redirect_url', 'https://bank.example.com/verify/3ds-999');
+
+        // Intentionally HALT the workflow here awaiting customer 3D-Secure verification:
+        echo ">>> HALTING SAGA: Awaiting 3D-Secure customer verification <<<" . PHP_EOL;
+        $c->suspend('Awaiting customer 3D-Secure bank verification');
     }
-    public function compensate(SagaContext $c): void {
-        echo "[Rollback] Payment refunded." . PHP_EOL;
-        $c->set('payment_id', null);
+
+    public function compensate(SagaContext $c): void
+    {
+        echo "[Rollback] Step 2: Authorization cancelled." . PHP_EOL;
     }
 }
 
-class SendConfirmationStep implements StepInterface
+class FulfillAndShipStep implements StepInterface
 {
-    public function getName(): string { return 'SendConfirmation'; }
-    public function execute(SagaContext $c): void {
-        echo "[Run] Confirmation email sent." . PHP_EOL;
-        $c->set('email_sent', true);
+    public function getName(): string { return 'FulfillAndShip'; }
+
+    public function execute(SagaContext $c): void
+    {
+        echo "[Run] Step 3: Payment verified! Dispatched with tracking #TRK-8888." . PHP_EOL;
+        $c->set('tracking_number', 'TRK-8888');
     }
-    public function compensate(SagaContext $c): void {}
+
+    public function compensate(SagaContext $c): void
+    {
+        echo "[Rollback] Step 3: Shipment recalled." . PHP_EOL;
+    }
 }
 
 // 3. Assemble the Saga Definition
-$saga = SagaBuilder::new('OrderCheckoutWorkflow')
-    ->addStep(new ReserveStockStep())
-    ->addStep(new ChargeCustomerStep())
-    ->addStep(new SendConfirmationStep())
+$saga = SagaBuilder::new('EcommerceCheckout')
+    ->addStep(new CreateOrderStep())
+    ->addStep(new RequestBankAuthorizationStep())
+    ->addStep(new FulfillAndShipStep())
     ->build();
 
-// =========================================================================
-// SCENARIO: Initial Run Crashes After Step 1 (ReserveStock)
-// =========================================================================
-$sagaId = 'order-saga-xyz-001';
-
-// Simulate that Step 1 completed before a server crash by saving state snapshot:
-$repository->save(new \PhpSaga\SagaState(
-    sagaId: $sagaId,
-    sagaType: 'OrderCheckoutWorkflow',
-    status: SagaStatus::IN_PROGRESS,
-    context: new SagaContext(['order_id' => 1001, 'amount' => 150.00, 'stock_reserved' => true]),
-    currentStep: 'ReserveStock',
-    completedSteps: ['ReserveStock']
-));
-
-// =========================================================================
-// RESUMPTION: Worker restarts and calls resume()
-// =========================================================================
-echo "--- Resuming Saga: {$sagaId} ---" . PHP_EOL;
 $coordinator = new SagaCoordinator(repository: $repository);
+$sagaId = 'order-xyz-100';
 
-$result = $coordinator->resume(
-    sagaId: $sagaId,
-    saga: $saga
+// =========================================================================
+// PHASE 1: INITIAL RUN (Executes Step 1 & 2, then HALTS and saves to disk)
+// =========================================================================
+$result = $coordinator->run(
+    saga: $saga,
+    context: ['order_id' => 'ORD-7001', 'amount' => 199.99],
+    sagaId: $sagaId
 );
 
-if ($result->isSuccessful()) {
-    echo "--- Saga Successfully Resumed and Completed! ---" . PHP_EOL;
-    echo "Status: " . $result->getState()->status->value . PHP_EOL; // "completed"
-    echo "Completed Steps: " . implode(', ', $result->getState()->completedSteps) . PHP_EOL;
-    // Output: ReserveStock, ChargeCustomer, SendConfirmation
+echo "Status: " . $result->getState()->status->value . PHP_EOL; // "suspended"
+echo "Exit Reason: " . $result->getState()->exitReason . PHP_EOL; 
+// Output: "Awaiting customer 3D-Secure bank verification"
+```
+
+**Console Output (Phase 1)**:
+```text
+[Run] Step 1: Order #ORD-7001 created.
+[Run] Step 2: Payment requested ($199.99).
+>>> HALTING SAGA: Awaiting 3D-Secure customer verification <<<
+Status: suspended
+Exit Reason: Awaiting customer 3D-Secure bank verification
+```
+
+**Saved File Snapshot (`storage/sagas/saga_order-xyz-100.json`)**:
+```json
+{
+    "saga_id": "order-xyz-100",
+    "saga_type": "EcommerceCheckout",
+    "status": "suspended",
+    "context": {
+        "order_id": "ORD-7001",
+        "amount": 199.99,
+        "order_created": true,
+        "auth_redirect_url": "https://bank.example.com/verify/3ds-999"
+    },
+    "current_step": "RequestBankAuthorization",
+    "completed_steps": [
+        "CreateOrder",
+        "RequestBankAuthorization"
+    ],
+    "exit_reason": "Awaiting customer 3D-Secure bank verification",
+    "created_at": "2026-10-30T10:00:00+00:00",
+    "updated_at": "2026-10-30T10:00:00+00:00"
 }
 ```
 
-**Console Output During Resumption**:
-```text
---- Resuming Saga: order-saga-xyz-001 ---
-[Run] Charged $150.00
-[Run] Confirmation email sent.
---- Saga Successfully Resumed and Completed! ---
-Status: completed
-Completed Steps: ReserveStock, ChargeCustomer, SendConfirmation
+---
+
+#### Resuming the Workflow (Phase 2)
+
+Hours or minutes later, when the bank webhook arrives, resume the saga. You can pass any new incoming webhook payload to be merged into the restored context:
+
+```php
+// =========================================================================
+// PHASE 2: RESUMPTION (Incoming webhook arrives with payment approval)
+// =========================================================================
+
+// Step 1 and Step 2 are automatically SKIPPED. Execution resumes at Step 3!
+$finalResult = $coordinator->resume(
+    sagaId: $sagaId,
+    saga: $saga,
+    additionalContext: [
+        'payment_status' => 'APPROVED',
+        'auth_token'     => 'bank_tok_555444333',
+    ]
+);
+
+if ($finalResult->isSuccessful()) {
+    echo "Status: " . $finalResult->getState()->status->value . PHP_EOL; // "completed"
+    echo "Completed Steps: " . implode(', ', $finalResult->getState()->completedSteps) . PHP_EOL;
+    echo "Tracking: " . $finalResult->getContext()->get('tracking_number') . PHP_EOL;
+}
 ```
-Notice that **`ReserveStock` was not re-executed**; its state was preserved, and only the remaining steps executed!
+
+**Console Output (Phase 2)**:
+```text
+[Run] Step 3: Payment verified! Dispatched with tracking #TRK-8888.
+Status: completed
+Completed Steps: CreateOrder, RequestBankAuthorization, FulfillAndShip
+Tracking: TRK-8888
+```
+
+> **Tip**: `$coordinator->run($saga, $context, $sagaId)` is also fully **idempotent**. If passed an existing suspended saga ID, it automatically resumes instead of starting over.
+
+---
+
+### 📁 File Storage (Disk-Based JSON Repository)
+
+For CLI apps, microservices, local development, or environments without a database, persist state directly as JSON files:
+
+```php
+use PhpSaga\Storage\FileSagaRepository;
+
+// Automatically creates the directory if needed
+$repository = new FileSagaRepository(__DIR__ . '/storage/sagas');
+
+$coordinator = new SagaCoordinator(repository: $repository);
+```
+- Each saga is safely stored as `saga_{sagaId}.json` with atomic file locking (`LOCK_EX`).
+- Supports `find()`, `save()`, `updateStatus()`, `updateContext()`, `delete()`, `count()`, and `clear()`.
 
 ---
 
@@ -288,23 +361,6 @@ $coordinator = new SagaCoordinator(repository: $repository);
 
 ---
 
-### 📁 File Storage (Disk-Based JSON Repository)
-
-For CLI apps, microservices, or local environments without a database, persist state directly as JSON files:
-
-```php
-use PhpSaga\Storage\FileSagaRepository;
-
-// Automatically creates the directory if needed
-$repository = new FileSagaRepository(__DIR__ . '/storage/sagas');
-
-$coordinator = new SagaCoordinator(repository: $repository);
-```
-- Each saga is safely stored as `saga_{sagaId}.json` with atomic file locking (`LOCK_EX`).
-- Supports `find()`, `save()`, `updateStatus()`, `updateContext()`, `delete()`, `count()`, and `clear()`.
-
----
-
 ### 📡 Observability & Events (PSR-14)
 
 Attach any PSR-14 event dispatcher to track execution telemetry:
@@ -320,6 +376,7 @@ Dispatched events (under `PhpSaga\Events\`):
 - `SagaStarted`
 - `StepExecuting` / `StepExecuted` / `StepFailed`
 - `CompensationExecuting` / `CompensationExecuted`
+- `SagaSuspended`
 - `SagaCompleted` / `SagaCompensated` / `SagaFailed`
 
 ---
