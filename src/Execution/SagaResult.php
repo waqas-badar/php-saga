@@ -18,6 +18,7 @@ readonly class SagaResult
         public SagaContext $context,
         public bool $isSuccessful,
         public bool $isCompensated,
+        public bool $isSuspended = false,
         public ?Throwable $executionException = null,
         public ?Throwable $compensationException = null,
     ) {}
@@ -32,9 +33,14 @@ readonly class SagaResult
         return $this->isCompensated;
     }
 
+    public function isSuspended(): bool
+    {
+        return $this->isSuspended;
+    }
+
     public function hasFailed(): bool
     {
-        return !$this->isSuccessful;
+        return !$this->isSuccessful && !$this->isSuspended;
     }
 
     public function getContext(): SagaContext

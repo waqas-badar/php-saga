@@ -14,30 +14,13 @@ Handle complex, distributed, multi-step business transactions without external r
 
 ## ⚡ Highlights
 
-- **Framework-Agnostic & Lightweight**: Zero runtime framework coupling. Runs in vanilla PHP, Laravel, Symfony, or queue workers.
+- **Framework-Agnostic & Lightweight**: Zero runtime framework coupling. Runs in vanilla PHP, Laravel, Symfony, or background queue workers.
 - **Strictly Typed & Modern**: Built for PHP 8.2+ with backed Enums, `readonly` classes, and match expressions.
 - **Automatic LIFO Rollback**: When any step fails, previously completed steps are safely compensated in reverse order (Last-In, First-Out).
 - **Configurable Retries**: Per-step retry policies with millisecond backoff for transient network glitches.
 - **Crash Recovery & Resumption**: Rehydrate interrupted or queued workflows from storage and resume from the exact pending step.
 - **PSR-11 & PSR-14 Compliant**: On-demand dependency injection for steps (`class-string`) and native event dispatching for observability.
-- **Pluggable Persistence**: Includes high-performance `PdoSagaRepository` (SQLite, MySQL, Postgres) and `InMemorySagaRepository`.
-
----
-
-## 🔄 Saga Lifecycle State Machine
-
-```mermaid
-stateDiagram-v2
-    [*] --> PENDING: Initialized
-    PENDING --> IN_PROGRESS: Start Execution
-    IN_PROGRESS --> COMPLETED: All Steps Succeeded
-    IN_PROGRESS --> COMPENSATING: Step Execution Failed
-    COMPENSATING --> COMPENSATED: All Prior Steps Compensated (LIFO)
-    COMPENSATING --> FAILED: Compensation Step Crashed
-    COMPLETED --> [*]
-    COMPENSATED --> [*]
-    FAILED --> [*]
-```
+- **Pluggable Persistence**: Includes `PdoSagaRepository` (SQLite, MySQL, Postgres), `FileSagaRepository` (disk-based JSON), and `InMemorySagaRepository`.
 
 ---
 
@@ -164,16 +147,126 @@ $result = $coordinator->run(new OrderFulfillmentSaga(), [
 
 ### 🔁 Crash Recovery & Workflow Resumption
 
-In distributed environments or queue workers (e.g. Laravel Queue / Symfony Messenger), a process might terminate mid-execution. `php-saga` can persist each step's snapshot and resume without repeating work:
+In distributed architectures, background workers, or queue processing, workflows are vulnerable to external interruptions:
+- A worker process terminates or times out mid-execution.
+- A deployment or pod restart kills an active saga.
+- A database or third-party API is temporarily unreachable.
+
+Rather than re-running the entire saga from the start (which could charge a customer twice or duplicate external mutations), `php-saga` provides native **snapshot rehydration and execution resumption**.
+
+#### How Resumption Works Under the Hood
+1. **Continuous State Snapshotting**: After each successful step, `SagaCoordinator` saves the updated `SagaContext`, list of `completedSteps`, and current status to the `SagaRepositoryInterface`.
+2. **Step Skipping**: When `$coordinator->resume($sagaId, $saga)` is called, the coordinator reads the persisted record and builds a set of already completed step names. Steps present in `completedSteps` are **skipped**.
+3. **Seamless Continuation**: Execution picks up directly at the first pending step, passing the restored context.
+4. **Unified LIFO Compensation**: If a step fails *after* resumption, the coordinator triggers backward compensation across **all** completed steps (both the steps executed in the initial run and those executed during the resumed run) in strict reverse order (Last-In, First-Out).
+
+---
+
+#### End-to-End Example: Crash and Resumption
+
+Below is a complete, runnable example demonstrating how an interrupted saga is resumed:
 
 ```php
-$coordinator = new SagaCoordinator($pdoRepository);
+use PhpSaga\Contracts\StepInterface;
+use PhpSaga\Execution\SagaBuilder;
+use PhpSaga\Execution\SagaCoordinator;
+use PhpSaga\SagaContext;
+use PhpSaga\SagaStatus;
+use PhpSaga\Storage\PdoSagaRepository;
 
-// Resumes from the exact step that was pending:
-$result = $coordinator->resume('saga-order-uuid-123', new OrderFulfillmentSaga());
+// 1. Setup Database Repository
+$pdo = new PDO('sqlite::memory:');
+$repository = new PdoSagaRepository($pdo);
+$repository->createSchema();
+
+// 2. Define Steps
+class ReserveStockStep implements StepInterface
+{
+    public function getName(): string { return 'ReserveStock'; }
+    public function execute(SagaContext $c): void {
+        echo "[Run] Stock reserved for Order #" . $c->get('order_id') . PHP_EOL;
+        $c->set('stock_reserved', true);
+    }
+    public function compensate(SagaContext $c): void {
+        echo "[Rollback] Stock released." . PHP_EOL;
+        $c->set('stock_reserved', false);
+    }
+}
+
+class ChargeCustomerStep implements StepInterface
+{
+    public function getName(): string { return 'ChargeCustomer'; }
+    public function execute(SagaContext $c): void {
+        echo "[Run] Charged $" . $c->get('amount') . PHP_EOL;
+        $c->set('payment_id', 'PAY-987');
+    }
+    public function compensate(SagaContext $c): void {
+        echo "[Rollback] Payment refunded." . PHP_EOL;
+        $c->set('payment_id', null);
+    }
+}
+
+class SendConfirmationStep implements StepInterface
+{
+    public function getName(): string { return 'SendConfirmation'; }
+    public function execute(SagaContext $c): void {
+        echo "[Run] Confirmation email sent." . PHP_EOL;
+        $c->set('email_sent', true);
+    }
+    public function compensate(SagaContext $c): void {}
+}
+
+// 3. Assemble the Saga Definition
+$saga = SagaBuilder::new('OrderCheckoutWorkflow')
+    ->addStep(new ReserveStockStep())
+    ->addStep(new ChargeCustomerStep())
+    ->addStep(new SendConfirmationStep())
+    ->build();
+
+// =========================================================================
+// SCENARIO: Initial Run Crashes After Step 1 (ReserveStock)
+// =========================================================================
+$sagaId = 'order-saga-xyz-001';
+
+// Simulate that Step 1 completed before a server crash by saving state snapshot:
+$repository->save(new \PhpSaga\SagaState(
+    sagaId: $sagaId,
+    sagaType: 'OrderCheckoutWorkflow',
+    status: SagaStatus::IN_PROGRESS,
+    context: new SagaContext(['order_id' => 1001, 'amount' => 150.00, 'stock_reserved' => true]),
+    currentStep: 'ReserveStock',
+    completedSteps: ['ReserveStock']
+));
+
+// =========================================================================
+// RESUMPTION: Worker restarts and calls resume()
+// =========================================================================
+echo "--- Resuming Saga: {$sagaId} ---" . PHP_EOL;
+$coordinator = new SagaCoordinator(repository: $repository);
+
+$result = $coordinator->resume(
+    sagaId: $sagaId,
+    saga: $saga
+);
+
+if ($result->isSuccessful()) {
+    echo "--- Saga Successfully Resumed and Completed! ---" . PHP_EOL;
+    echo "Status: " . $result->getState()->status->value . PHP_EOL; // "completed"
+    echo "Completed Steps: " . implode(', ', $result->getState()->completedSteps) . PHP_EOL;
+    // Output: ReserveStock, ChargeCustomer, SendConfirmation
+}
 ```
-- Steps already recorded in `completedSteps` are **skipped**.
-- If a subsequent step fails, all steps (including those from prior runs) are compensated in proper LIFO order.
+
+**Console Output During Resumption**:
+```text
+--- Resuming Saga: order-saga-xyz-001 ---
+[Run] Charged $150.00
+[Run] Confirmation email sent.
+--- Saga Successfully Resumed and Completed! ---
+Status: completed
+Completed Steps: ReserveStock, ChargeCustomer, SendConfirmation
+```
+Notice that **`ReserveStock` was not re-executed**; its state was preserved, and only the remaining steps executed!
 
 ---
 
@@ -195,6 +288,23 @@ $coordinator = new SagaCoordinator(repository: $repository);
 
 ---
 
+### 📁 File Storage (Disk-Based JSON Repository)
+
+For CLI apps, microservices, or local environments without a database, persist state directly as JSON files:
+
+```php
+use PhpSaga\Storage\FileSagaRepository;
+
+// Automatically creates the directory if needed
+$repository = new FileSagaRepository(__DIR__ . '/storage/sagas');
+
+$coordinator = new SagaCoordinator(repository: $repository);
+```
+- Each saga is safely stored as `saga_{sagaId}.json` with atomic file locking (`LOCK_EX`).
+- Supports `find()`, `save()`, `updateStatus()`, `updateContext()`, `delete()`, `count()`, and `clear()`.
+
+---
+
 ### 📡 Observability & Events (PSR-14)
 
 Attach any PSR-14 event dispatcher to track execution telemetry:
@@ -211,36 +321,6 @@ Dispatched events (under `PhpSaga\Events\`):
 - `StepExecuting` / `StepExecuted` / `StepFailed`
 - `CompensationExecuting` / `CompensationExecuted`
 - `SagaCompleted` / `SagaCompensated` / `SagaFailed`
-
----
-
-### 🔌 Framework Integration (e.g. Laravel)
-
-Because `php-saga` adheres to **PSR-11** (Container) and **PSR-14** (Events), registering it in Laravel takes just a few lines in a ServiceProvider:
-
-```php
-use Illuminate\Support\ServiceProvider;
-use PhpSaga\Execution\ContainerStepResolver;
-use PhpSaga\Execution\SagaCoordinator;
-use PhpSaga\Storage\PdoSagaRepository;
-use Illuminate\Support\Facades\DB;
-
-class SagaServiceProvider extends ServiceProvider
-{
-    public function register(): void
-    {
-        $this->app->singleton(SagaCoordinator::class, function ($app) {
-            return new SagaCoordinator(
-                repository: new PdoSagaRepository(DB::connection()->getPdo()),
-                dispatcher: $app['events'],                // Implements PSR-14
-                stepResolver: new ContainerStepResolver($app) // Implements PSR-11
-            );
-        });
-    }
-}
-```
-
-Now any step configured as a class-string (e.g. `addStep(ProcessPaymentStep::class)`) will have its constructor dependencies automatically injected by Laravel!
 
 ---
 

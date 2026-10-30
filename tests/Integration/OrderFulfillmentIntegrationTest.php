@@ -250,7 +250,7 @@ it('triggers complete backward compensation and restores state when a step fails
     assert($persisted instanceof \PhpSaga\SagaState);
     expect($persisted->status)->toBe(SagaStatus::COMPENSATED)
         ->and($persisted->context->get('is_refunded'))->toBeTrue()
-        ->and($persisted->failureReason)->toBe('Courier API gateway timeout.');
+        ->and($persisted->exitReason)->toBe('Courier API gateway timeout.');
 
     // Verify last event was SagaCompensated
     $lastEvent = end($events);

@@ -7,6 +7,7 @@ use PhpSaga\SagaStatus;
 it('has all required backed string values', function () {
     expect(SagaStatus::PENDING->value)->toBe('pending')
         ->and(SagaStatus::IN_PROGRESS->value)->toBe('in_progress')
+        ->and(SagaStatus::SUSPENDED->value)->toBe('suspended')
         ->and(SagaStatus::COMPLETED->value)->toBe('completed')
         ->and(SagaStatus::COMPENSATING->value)->toBe('compensating')
         ->and(SagaStatus::COMPENSATED->value)->toBe('compensated')

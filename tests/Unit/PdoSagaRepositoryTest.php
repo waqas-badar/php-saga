@@ -56,14 +56,14 @@ it('updates status and context in PDO repository', function () {
     );
     $repo->save($state);
 
-    $repo->updateStatus('pdo-saga-2', SagaStatus::FAILED, currentStep: 'SendInvoice', failureReason: 'Mailgun down');
+    $repo->updateStatus('pdo-saga-2', SagaStatus::FAILED, currentStep: 'SendInvoice', exitReason: 'Mailgun down');
     $updated = $repo->find('pdo-saga-2');
 
     expect($updated)->not->toBeNull();
     assert($updated instanceof SagaState);
     expect($updated->status)->toBe(SagaStatus::FAILED)
         ->and($updated->currentStep)->toBe('SendInvoice')
-        ->and($updated->failureReason)->toBe('Mailgun down');
+        ->and($updated->exitReason)->toBe('Mailgun down');
 
     $repo->updateContext('pdo-saga-2', new SagaContext(['inv_id' => 1, 'retry_scheduled' => true]));
     $contextUpdated = $repo->find('pdo-saga-2');

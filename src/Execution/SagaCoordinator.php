@@ -15,10 +15,12 @@ use PhpSaga\Events\SagaCompleted;
 use PhpSaga\Events\SagaCompensated;
 use PhpSaga\Events\SagaFailed;
 use PhpSaga\Events\SagaStarted;
+use PhpSaga\Events\SagaSuspended;
 use PhpSaga\Events\StepExecuted;
 use PhpSaga\Events\StepExecuting;
 use PhpSaga\Events\StepFailed;
 use PhpSaga\Exceptions\SagaNotFoundException;
+use PhpSaga\Exceptions\SagaSuspendedException;
 use PhpSaga\SagaContext;
 use PhpSaga\SagaState;
 use PhpSaga\SagaStatus;
@@ -59,6 +61,24 @@ class SagaCoordinator
         $sagaContext = $context instanceof SagaContext ? $context : SagaContext::fromArray($context);
         $id = $sagaId ?? $this->generateSagaId();
 
+        if ($sagaId !== null && $this->repository?->exists($id)) {
+            $existing = $this->repository->find($id);
+            if ($existing !== null) {
+                if ($existing->status->isActive() || $existing->status->isSuspended()) {
+                    return $this->resume($id, $saga, $sagaContext);
+                }
+
+                if ($existing->status->isTerminal()) {
+                    return new SagaResult(
+                        state: $existing,
+                        context: $existing->context,
+                        isSuccessful: $existing->status->isSuccessful(),
+                        isCompensated: $existing->status === SagaStatus::COMPENSATED,
+                    );
+                }
+            }
+        }
+
         $state = new SagaState(
             sagaId: $id,
             sagaType: $definition->getSagaType(),
@@ -88,8 +108,22 @@ class SagaCoordinator
      * @throws SagaNotFoundException If saga record does not exist in repository
      * @throws LogicException If no repository is configured
      */
-    public function resume(string $sagaId, SagaDefinition|SagaInterface $saga): SagaResult
-    {
+    /**
+     * Resumes an existing saga workflow from storage by its ID.
+     * Skips already completed steps and continues forward execution,
+     * or resumes compensation if previously interrupted.
+     *
+     * @param string $sagaId Unique saga instance ID
+     * @param SagaDefinition|SagaInterface $saga Saga definition or class
+     * @param SagaContext|array<string, mixed> $additionalContext Optional additional context data to merge into restored context
+     * @throws SagaNotFoundException If saga record does not exist in repository
+     * @throws LogicException If no repository is configured
+     */
+    public function resume(
+        string $sagaId,
+        SagaDefinition|SagaInterface $saga,
+        SagaContext|array $additionalContext = []
+    ): SagaResult {
         if ($this->repository === null) {
             throw new LogicException("Cannot resume saga '{$sagaId}' without a configured SagaRepository.");
         }
@@ -101,6 +135,14 @@ class SagaCoordinator
 
         $definition = $saga instanceof SagaInterface ? $saga->getDefinition() : $saga;
         $context = $state->context;
+        if ($context->isSuspended()) {
+            $context->unsuspend();
+        }
+
+        $incoming = $additionalContext instanceof SagaContext ? $additionalContext->all() : $additionalContext;
+        if (!empty($incoming)) {
+            $context->merge($incoming);
+        }
 
         if ($state->status === SagaStatus::COMPLETED) {
             return new SagaResult(
@@ -148,7 +190,7 @@ class SagaCoordinator
                 failedStep: $lastStep,
                 context: $context,
                 state: $state,
-                executionException: new LogicException($state->failureReason ?? 'Resuming compensation')
+                executionException: new LogicException($state->exitReason ?? 'Resuming compensation')
             );
         }
 
@@ -185,7 +227,37 @@ class SagaCoordinator
             $this->repository?->save($state);
 
             $stepInstance = $this->stepResolver->resolve($stepDefinition->step);
-            $stepError = $this->executeWithRetries($stepInstance, $stepDefinition, $context, $state->sagaId);
+            $stepError = null;
+            $isSuspended = false;
+            $suspendReason = null;
+
+            try {
+                $stepError = $this->executeWithRetries($stepInstance, $stepDefinition, $context, $state->sagaId);
+            } catch (SagaSuspendedException $suspendEx) {
+                $isSuspended = true;
+                $suspendReason = $suspendEx->getMessage();
+            }
+
+            if ($isSuspended || $context->isSuspended()) {
+                $suspendReason ??= $context->getSuspendReason();
+                $executedSteps[] = $stepDefinition;
+                $state = $state->withCompletedStep($stepName)->withContext($context);
+                $state = $state->withStatus(
+                    status: SagaStatus::SUSPENDED,
+                    currentStep: $stepName,
+                    exitReason: $suspendReason
+                );
+                $this->repository?->save($state);
+                $this->dispatch(new SagaSuspended($state, $context, $suspendReason));
+
+                return new SagaResult(
+                    state: $state,
+                    context: $context,
+                    isSuccessful: false,
+                    isCompensated: false,
+                    isSuspended: true
+                );
+            }
 
             if ($stepError === null) {
                 $executedSteps[] = $stepDefinition;
@@ -247,7 +319,7 @@ class SagaCoordinator
         $state = $state->withStatus(
             status: SagaStatus::COMPENSATING,
             currentStep: $failedStep->getName(),
-            failureReason: $failureMessage
+            exitReason: $failureMessage
         );
         $this->repository?->save($state);
 
@@ -260,7 +332,7 @@ class SagaCoordinator
             $state = $state->withStatus(
                 status: SagaStatus::COMPENSATING,
                 currentStep: $stepName,
-                failureReason: $failureMessage
+                exitReason: $failureMessage
             );
             $this->repository?->save($state);
 
@@ -275,7 +347,7 @@ class SagaCoordinator
                 $state = $state->withStatus(
                     status: SagaStatus::FAILED,
                     currentStep: $stepName,
-                    failureReason: $compReason
+                    exitReason: $compReason
                 );
                 $this->repository?->save($state);
 
@@ -295,7 +367,7 @@ class SagaCoordinator
         $state = $state->withStatus(
             status: SagaStatus::COMPENSATED,
             currentStep: null,
-            failureReason: $failureMessage
+            exitReason: $failureMessage
         );
         $this->repository?->save($state);
 
@@ -332,6 +404,8 @@ class SagaCoordinator
                 $stepInstance->execute($context);
 
                 return null;
+            } catch (SagaSuspendedException $suspend) {
+                throw $suspend;
             } catch (Throwable $e) {
                 $lastException = $e;
                 if ($attempts < $maxAttempts && $stepDefinition->retryDelayMs > 0) {

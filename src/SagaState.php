@@ -19,7 +19,7 @@ readonly class SagaState implements JsonSerializable
      * @param SagaContext $context Snapshot of shared context data
      * @param string|null $currentStep Currently executing or last attempted step
      * @param array<int, string> $completedSteps Ordered list of successfully executed step names
-     * @param string|null $failureReason Description or exception message if failed
+     * @param string|null $exitReason Description, exception message, or suspension reason
      * @param DateTimeImmutable $createdAt Timestamp when saga was created
      * @param DateTimeImmutable $updatedAt Timestamp of the most recent state change
      */
@@ -30,7 +30,7 @@ readonly class SagaState implements JsonSerializable
         public SagaContext $context,
         public ?string $currentStep = null,
         public array $completedSteps = [],
-        public ?string $failureReason = null,
+        public ?string $exitReason = null,
         public DateTimeImmutable $createdAt = new DateTimeImmutable(),
         public DateTimeImmutable $updatedAt = new DateTimeImmutable(),
     ) {}
@@ -38,7 +38,7 @@ readonly class SagaState implements JsonSerializable
     /**
      * Returns a new instance with updated status and timestamp.
      */
-    public function withStatus(SagaStatus $status, ?string $currentStep = null, ?string $failureReason = null): self
+    public function withStatus(SagaStatus $status, ?string $currentStep = null, ?string $exitReason = null): self
     {
         return new self(
             sagaId: $this->sagaId,
@@ -47,7 +47,7 @@ readonly class SagaState implements JsonSerializable
             context: $this->context,
             currentStep: $currentStep ?? $this->currentStep,
             completedSteps: $this->completedSteps,
-            failureReason: $failureReason ?? $this->failureReason,
+            exitReason: $exitReason ?? $this->exitReason,
             createdAt: $this->createdAt,
             updatedAt: new DateTimeImmutable(),
         );
@@ -65,7 +65,7 @@ readonly class SagaState implements JsonSerializable
             context: $context,
             currentStep: $this->currentStep,
             completedSteps: $this->completedSteps,
-            failureReason: $this->failureReason,
+            exitReason: $this->exitReason,
             createdAt: $this->createdAt,
             updatedAt: new DateTimeImmutable(),
         );
@@ -88,7 +88,7 @@ readonly class SagaState implements JsonSerializable
             context: $this->context,
             currentStep: $stepName,
             completedSteps: $steps,
-            failureReason: $this->failureReason,
+            exitReason: $this->exitReason,
             createdAt: $this->createdAt,
             updatedAt: new DateTimeImmutable(),
         );
@@ -106,7 +106,7 @@ readonly class SagaState implements JsonSerializable
             'context' => $this->context->jsonSerialize(),
             'current_step' => $this->currentStep,
             'completed_steps' => $this->completedSteps,
-            'failure_reason' => $this->failureReason,
+            'exit_reason' => $this->exitReason,
             'created_at' => $this->createdAt->format(DateTimeImmutable::ATOM),
             'updated_at' => $this->updatedAt->format(DateTimeImmutable::ATOM),
         ];
@@ -142,7 +142,7 @@ readonly class SagaState implements JsonSerializable
             }
         }
 
-        $failureReason = isset($data['failure_reason']) && is_scalar($data['failure_reason']) ? (string) $data['failure_reason'] : null;
+        $exitReason = isset($data['exit_reason']) && is_scalar($data['exit_reason']) ? (string) $data['exit_reason'] : null;
         $createdAt = isset($data['created_at']) && is_string($data['created_at'])
             ? new DateTimeImmutable($data['created_at'])
             : new DateTimeImmutable();
@@ -157,7 +157,7 @@ readonly class SagaState implements JsonSerializable
             context: SagaContext::fromArray($contextMap),
             currentStep: $currentStep,
             completedSteps: $completedSteps,
-            failureReason: $failureReason,
+            exitReason: $exitReason,
             createdAt: $createdAt,
             updatedAt: $updatedAt,
         );

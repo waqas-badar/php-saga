@@ -13,12 +13,44 @@ use JsonSerializable;
  */
 class SagaContext implements JsonSerializable
 {
+    private bool $isSuspended = false;
+    private ?string $suspendReason = null;
+
     /**
      * @param array<string, mixed> $data
      */
     public function __construct(
         private array $data = []
     ) {}
+
+    /**
+     * Intentionally halts/suspends the saga after this step without triggering compensation.
+     */
+    public function suspend(?string $reason = null): self
+    {
+        $this->isSuspended = true;
+        $this->suspendReason = $reason;
+
+        return $this;
+    }
+
+    public function isSuspended(): bool
+    {
+        return $this->isSuspended;
+    }
+
+    public function getSuspendReason(): ?string
+    {
+        return $this->suspendReason;
+    }
+
+    public function unsuspend(): self
+    {
+        $this->isSuspended = false;
+        $this->suspendReason = null;
+
+        return $this;
+    }
 
     /**
      * Retrieve a value from the context by key.

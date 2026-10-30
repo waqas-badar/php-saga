@@ -39,11 +39,11 @@ class InMemorySagaRepository implements SagaRepositoryInterface
         string $sagaId,
         SagaStatus $status,
         ?string $currentStep = null,
-        ?string $failureReason = null
+        ?string $exitReason = null
     ): void {
         $state = $this->find($sagaId);
         if ($state !== null) {
-            $this->save($state->withStatus($status, $currentStep, $failureReason));
+            $this->save($state->withStatus($status, $currentStep, $exitReason));
         }
     }
 

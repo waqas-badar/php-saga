@@ -34,7 +34,7 @@ class PdoSagaRepository implements SagaRepositoryInterface
             context TEXT NOT NULL,
             current_step VARCHAR(128) NULL,
             completed_steps TEXT NOT NULL,
-            failure_reason TEXT NULL,
+            exit_reason TEXT NULL,
             created_at VARCHAR(32) NOT NULL,
             updated_at VARCHAR(32) NOT NULL
         )";
@@ -51,14 +51,14 @@ class PdoSagaRepository implements SagaRepositoryInterface
                 context = :context,
                 current_step = :current_step,
                 completed_steps = :completed_steps,
-                failure_reason = :failure_reason,
+                exit_reason = :exit_reason,
                 updated_at = :updated_at
                 WHERE saga_id = :saga_id";
         } else {
             $sql = "INSERT INTO {$this->tableName} (
-                saga_id, saga_type, status, context, current_step, completed_steps, failure_reason, created_at, updated_at
+                saga_id, saga_type, status, context, current_step, completed_steps, exit_reason, created_at, updated_at
             ) VALUES (
-                :saga_id, :saga_type, :status, :context, :current_step, :completed_steps, :failure_reason, :created_at, :updated_at
+                :saga_id, :saga_type, :status, :context, :current_step, :completed_steps, :exit_reason, :created_at, :updated_at
             )";
         }
 
@@ -69,7 +69,7 @@ class PdoSagaRepository implements SagaRepositoryInterface
         $stmt->bindValue(':context', $state->context->toJson());
         $stmt->bindValue(':current_step', $state->currentStep);
         $stmt->bindValue(':completed_steps', json_encode($state->completedSteps, JSON_THROW_ON_ERROR));
-        $stmt->bindValue(':failure_reason', $state->failureReason);
+        $stmt->bindValue(':exit_reason', $state->exitReason);
         $stmt->bindValue(':updated_at', $state->updatedAt->format(DateTimeImmutable::ATOM));
 
         if (!str_contains($sql, 'UPDATE')) {
@@ -96,6 +96,8 @@ class PdoSagaRepository implements SagaRepositoryInterface
         /** @var array<int, string> $safeCompletedSteps */
         $safeCompletedSteps = is_array($completedSteps) ? array_values(array_map('strval', $completedSteps)) : [];
 
+        $exitReason = is_string($row['exit_reason'] ?? null) ? $row['exit_reason'] : null;
+
         return new SagaState(
             sagaId: (string) $row['saga_id'],
             sagaType: (string) $row['saga_type'],
@@ -103,7 +105,7 @@ class PdoSagaRepository implements SagaRepositoryInterface
             context: SagaContext::fromJson($contextJson),
             currentStep: is_string($row['current_step']) ? $row['current_step'] : null,
             completedSteps: $safeCompletedSteps,
-            failureReason: is_string($row['failure_reason']) ? $row['failure_reason'] : null,
+            exitReason: $exitReason,
             createdAt: new DateTimeImmutable((string) $row['created_at']),
             updatedAt: new DateTimeImmutable((string) $row['updated_at']),
         );
@@ -121,11 +123,11 @@ class PdoSagaRepository implements SagaRepositoryInterface
         string $sagaId,
         SagaStatus $status,
         ?string $currentStep = null,
-        ?string $failureReason = null
+        ?string $exitReason = null
     ): void {
         $state = $this->find($sagaId);
         if ($state !== null) {
-            $this->save($state->withStatus($status, $currentStep, $failureReason));
+            $this->save($state->withStatus($status, $currentStep, $exitReason));
         }
     }
 

@@ -11,6 +11,7 @@ enum SagaStatus: string
 {
     case PENDING = 'pending';
     case IN_PROGRESS = 'in_progress';
+    case SUSPENDED = 'suspended';
     case COMPLETED = 'completed';
     case COMPENSATING = 'compensating';
     case COMPENSATED = 'compensated';
@@ -25,6 +26,14 @@ enum SagaStatus: string
             self::IN_PROGRESS, self::COMPENSATING => true,
             default => false,
         };
+    }
+
+    /**
+     * Determines whether the saga is currently suspended/halted waiting for external resumption.
+     */
+    public function isSuspended(): bool
+    {
+        return $this === self::SUSPENDED;
     }
 
     /**
@@ -57,4 +66,3 @@ enum SagaStatus: string
         };
     }
 }
-

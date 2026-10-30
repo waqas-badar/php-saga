@@ -35,7 +35,7 @@ interface SagaRepositoryInterface
         string $sagaId,
         SagaStatus $status,
         ?string $currentStep = null,
-        ?string $failureReason = null
+        ?string $exitReason = null
     ): void;
 
     /**

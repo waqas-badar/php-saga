@@ -42,14 +42,14 @@ it('can update status and current step', function () {
     );
     $repo->save($state);
 
-    $repo->updateStatus('saga-002', SagaStatus::FAILED, currentStep: 'ChargeCreditCard', failureReason: 'Card expired');
+    $repo->updateStatus('saga-002', SagaStatus::FAILED, currentStep: 'ChargeCreditCard', exitReason: 'Card expired');
     $updated = $repo->find('saga-002');
 
     expect($updated)->not->toBeNull();
     assert($updated instanceof SagaState);
     expect($updated->status)->toBe(SagaStatus::FAILED)
         ->and($updated->currentStep)->toBe('ChargeCreditCard')
-        ->and($updated->failureReason)->toBe('Card expired');
+        ->and($updated->exitReason)->toBe('Card expired');
 });
 
 it('can update context and delete saga state', function () {
